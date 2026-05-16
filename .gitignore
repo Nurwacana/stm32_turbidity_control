@@ -1,0 +1,10 @@
+.vscode
+.metadata
+**/.settings
+*/Debug
+
+
+# Debugger / temporary
+*.launch
+
+
