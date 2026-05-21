@@ -30,7 +30,7 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-#define BUFFER_CONVERSION_SIZE 1000
+#define BUFFER_CONVERSION_SIZE 1500
 typedef struct {
 	uint16_t buffer[BUFFER_CONVERSION_SIZE];
 	uint16_t buffer_counter;
@@ -63,6 +63,7 @@ osThreadId usbTaskHandle;
 osThreadId turbidityTaskHandle;
 /* USER CODE BEGIN PV */
 
+HAL_StatusTypeDef I2c_lcd;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -76,6 +77,56 @@ void StartUsbTask(void const * argument);
 void StartTurbidityTask(void const * argument);
 
 /* USER CODE BEGIN PFP */
+void revive_I2C_rtos(I2C_HandleTypeDef *hi2c,
+		GPIO_TypeDef *GPIOx,
+		uint16_t scl_pin,
+		uint16_t sda_pin)
+{
+	GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+	/* 1. Abort & DeInit I2C + DMA */
+	HAL_I2C_DeInit(hi2c);
+
+	if (hi2c->hdmarx)
+	{
+		HAL_DMA_Abort(hi2c->hdmarx);
+		HAL_DMA_DeInit(hi2c->hdmarx);
+	}
+
+	/* 2. Enable GPIO clock (manual, user must ensure correct RCC) */
+	/* NOTE: Pastikan RCC GPIOx sudah di-enable sebelum panggil fungsi ini */
+
+	/* 3. Set SDA & SCL sebagai GPIO Open-Drain */
+	GPIO_InitStruct.Pin   = scl_pin | sda_pin;
+	GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_OD;
+	GPIO_InitStruct.Pull  = GPIO_NOPULL;
+	GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+	HAL_GPIO_Init(GPIOx, &GPIO_InitStruct);
+
+	/* 4. Force SDA & SCL HIGH */
+	HAL_GPIO_WritePin(GPIOx, scl_pin | sda_pin, GPIO_PIN_SET);
+	osDelay(1);
+
+	/* 5. Clock pulse SCL untuk release slave (9 pulse I2C spec) */
+	for (uint8_t i = 0; i < 9; i++)
+	{
+		HAL_GPIO_WritePin(GPIOx, scl_pin, GPIO_PIN_RESET);
+		osDelay(1);
+		HAL_GPIO_WritePin(GPIOx, scl_pin, GPIO_PIN_SET);
+		osDelay(1);
+	}
+
+	/* 6. Pastikan SDA released */
+	HAL_GPIO_WritePin(GPIOx, sda_pin, GPIO_PIN_SET);
+	osDelay(1);
+
+	/* 7. Kembalikan pin ke AF Open-Drain (I2C) */
+	GPIO_InitStruct.Mode = GPIO_MODE_AF_OD;
+	HAL_GPIO_Init(GPIOx, &GPIO_InitStruct);
+
+	/* 8. Re-init I2C */
+	HAL_I2C_Init(hi2c);
+}
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -325,7 +376,6 @@ static void MX_GPIO_Init(void)
   /* USER CODE END MX_GPIO_Init_1 */
 
   /* GPIO Ports Clock Enable */
-  __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOD_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
@@ -351,6 +401,11 @@ I2C_LCD_HandleTypeDef g_lcd = {
 		.address = 0x4E
 };
 
+#define SLAVE_ADDRESS_LCD 0x4E
+
+#define LCD_BACKLIGHT 0x08
+#define ENABLE 0x04
+
 #define ADC_TO_VOLT (1.0F/4095.0F) * 3.3F
 
 char buffer[16];
@@ -361,12 +416,19 @@ volatile uint16_t adc_buffer[1];
 
 AdcTypedef_t g_turbidity;
 
+_Bool motor_state = 0;
+_Bool latch_condition = 0;
+
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
 {
 	if (hadc->Instance == ADC1)
 	{
 		// data baru siap
+		g_turbidity.buffer_total -= g_turbidity.buffer[g_turbidity.buffer_counter];
+
 		g_turbidity.buffer[g_turbidity.buffer_counter] = adc_buffer[0];
+
+		g_turbidity.buffer_total += g_turbidity.buffer[g_turbidity.buffer_counter];
 
 		g_turbidity.buffer_counter++;
 
@@ -376,11 +438,6 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
 
 	}
 }
-
-#define SLAVE_ADDRESS_LCD 0x4E // 0x27 << 1
-
-#define LCD_BACKLIGHT 0x08
-#define ENABLE 0x04
 
 
 /* USER CODE END 4 */
@@ -403,7 +460,16 @@ void StartDefaultTask(void const * argument)
 	for(;;)
 	{
 		lcd_gotoxy(&g_lcd, 0, 0);
-		sprintf(buffer, "NTU:%4.2f     ", g_turbidity.value);
+		sprintf(buffer, "KEKERUHAN:%4.2f   ", g_turbidity.value);
+		lcd_puts(&g_lcd, buffer);
+
+		lcd_gotoxy(&g_lcd, 0, 1);
+
+		if(motor_state) {
+			sprintf(buffer, "MOTOR: ON  ");
+		} else {
+			sprintf(buffer, "MOTOR: OFF ");
+		}
 		lcd_puts(&g_lcd, buffer);
 
 		osDelay(100);
@@ -445,24 +511,24 @@ void StartTurbidityTask(void const * argument)
 	/* Infinite loop */
 	for(;;)
 	{
-		g_turbidity.buffer_total = 0;
-		for(uint16_t i = 0; i < BUFFER_CONVERSION_SIZE; i++) {
-			g_turbidity.buffer_total += g_turbidity.buffer[i];
-		}
 		g_turbidity.volt = (float)g_turbidity.buffer_total * multiplier_conversion * ADC_TO_VOLT;
 
 		g_turbidity.volt_mod = g_turbidity.volt * (1.7F/3.3F) + 2.5;
-		g_turbidity.value = (-1120.4F * powf(g_turbidity.volt_mod, 2))
-				+ (5742.3F * g_turbidity.volt_mod)
-				- 4352.9F;
+//		g_turbidity.value = (-1120.4F * powf(g_turbidity.volt_mod, 2))
+//				+ (5742.3F * g_turbidity.volt_mod)
+//				- 4352.9F;
+
+		g_turbidity.value = (1- (g_turbidity.volt /3.3)) * 100.0F;
 
 		if(g_turbidity.value < 0) g_turbidity.value = 0;
 
-		if(g_turbidity.value > 1500) {
-			HAL_GPIO_WritePin(D_MOTOR_GPIO_Port, D_MOTOR_Pin, 1);
-		} else {
-			HAL_GPIO_WritePin(D_MOTOR_GPIO_Port, D_MOTOR_Pin, 0);
+		if(g_turbidity.value < 15) {
+			motor_state = 0;
+		} else if (g_turbidity.value > 50) {
+			motor_state = 1;
 		}
+
+		HAL_GPIO_WritePin(D_MOTOR_GPIO_Port, D_MOTOR_Pin, !motor_state);
 
 		osDelay(10);
 	}
